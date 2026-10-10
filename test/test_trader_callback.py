@@ -43,6 +43,7 @@ from unittest.mock import MagicMock, patch, call
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import position_manager
 from test.test_base import TestBase
 from position_manager import PositionManager
 from trading_executor import TradingExecutor
@@ -1033,6 +1034,77 @@ class TestTraderCallback(TestBase):
             config.PENDING_ORDER_AUTO_REORDER = old_reorder
 
         self.assertNotIn(stock_code, self.pm.pending_orders)
+
+    def test_d7_timeout_check_runs_when_positions_empty(self):
+        """回归 2026-10-08：清仓后持仓列表为空，委托超时检查不得被跳过。
+
+        原实现把 check_pending_orders_timeout() 放在监控循环尾部，而空仓分支
+        在它之前就 continue 了，于是"触发本次清仓的那笔委托"永远等不到兜底：
+        既不撤单也不确认成交、不写流水。
+        实盘 300792 止损卖出 3700 股（委托号 135266306）的流水即由此丢失。
+        """
+        self.pm.stop_flag = False
+        rounds = {"sleep": 0}
+
+        def _fake_sleep(_seconds):
+            rounds["sleep"] += 1
+            self.pm.stop_flag = True  # 跑完一轮立即退出，避免测试挂死
+
+        with patch.object(config, "is_trade_time", return_value=True), \
+             patch("time.sleep", side_effect=_fake_sleep), \
+             patch.object(self.pm, "get_all_positions", return_value=pd.DataFrame()), \
+             patch.object(self.pm, "check_pending_orders_timeout") as mock_check:
+            self.pm._position_monitor_loop()
+
+        mock_check.assert_called()
+
+    def test_d8_legitimate_flat_position_does_not_warn_as_interface_error(self):
+        """回归 2026-10-08：账户合法清仓不得被当成"接口异常"刷告警。
+
+        QMT 清仓后仍返回 volume=0 的残留行，行循环把它们全部丢弃并顺带删掉本地
+        记录，current_positions 因此为空。此时内存已无待删持仓，是正常清仓结果，
+        不能报"可能是接口异常，跳过删除操作"（实盘该告警刷了 385 条）。
+        """
+        self._insert_position(stock_code="300792", volume=3700)
+        # 先让本地记录被行循环清零，模拟"清仓那一轮"的最终状态
+        # （QMT position() 返回的是 6 位无后缀代码，见 easy_qmt_trader）
+        df = pd.DataFrame([{
+            "证券代码": "300792",
+            "证券名称": "壹网壹创",
+            "股票余额": 0,
+            "可用余额": 0,
+            "成本价": 25.46,
+            "市值": 0.0,
+        }])
+
+        with patch.object(position_manager.logger, "warning") as mock_warn:
+            self.pm._sync_real_positions_to_memory(df)
+
+        self.assertFalse(
+            any("外部持仓数据为空" in str(c) for c in mock_warn.call_args_list),
+            "合法清仓被误报为接口异常",
+        )
+
+    def test_d9_interface_anomaly_still_warns_when_memory_has_positions(self):
+        """内存仍有持仓未被任何有效行覆盖时，"接口异常"保护必须保留。"""
+        self._insert_position(stock_code="300792", volume=3700)
+        # QMT 只回了一行与内存持仓无关的无效行，内存里的 300792 无人覆盖
+        df = pd.DataFrame([{
+            "证券代码": "999999",
+            "证券名称": "占位",
+            "股票余额": 0,
+            "可用余额": 0,
+            "成本价": 0.0,
+            "市值": 0.0,
+        }])
+
+        with patch.object(position_manager.logger, "warning") as mock_warn:
+            self.pm._sync_real_positions_to_memory(df)
+
+        self.assertTrue(
+            any("外部持仓数据为空" in str(c) for c in mock_warn.call_args_list),
+            "内存仍有持仓却未保留接口异常告警",
+        )
 
     # ===================================================================
     # Group E: 重新挂单（_reorder_after_cancel）

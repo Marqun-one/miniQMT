@@ -713,8 +713,17 @@ class PositionManager:
                     return
 
                 # 数据完整性检查
+                # 能走到这里说明 QMT 返回了非空 DataFrame，只是所有行都被判为无效
+                # (volume<=0)。此时两种情形必须分开：
+                #   a) memory_stock_codes 为空 —— 内存持仓已在行循环里随之清空，
+                #      即账户真的清仓完毕，是正常结果，不能报"接口异常"；
+                #   b) memory_stock_codes 非空 —— QMT 只回了部分股票且全为无效行，
+                #      内存里还剩持仓没被任何一行覆盖，才可能是接口异常，保留删除保护。
                 if len(current_positions) == 0:
-                    logger.warning("外部持仓数据为空，可能是接口异常，跳过删除操作")
+                    if memory_stock_codes:
+                        logger.warning("外部持仓数据为空，可能是接口异常，跳过删除操作")
+                    else:
+                        logger.debug("QMT 返回的持仓行均已清零，本地无待删持仓")
                     return
 
                 # 数据量合理性检查
@@ -4955,6 +4964,11 @@ class PositionManager:
                     except Exception as e:
                         logger.error(f"[网格] 会话巡检异常: {e}")
 
+                # 委托单超时检查必须与持仓列表解耦：清仓后 positions_df 为空会走下方
+                # continue，若把检查留在循环尾部，清仓那一刻挂出的委托（典型就是触发
+                # 本次清仓的止损单）将永不被撤单/确认，成交流水随之丢失。
+                self.check_pending_orders_timeout()
+
                 if positions_df.empty:
                     logger.debug("当前没有持仓，无需监控")
                     time.sleep(60)
@@ -5036,9 +5050,6 @@ class PositionManager:
                             )
                     except (TypeError, ValueError) as e:
                         logger.error(f"更新最高价时类型转换错误 - {stock_code}: {e}")
-
-                # 检查委托单超时
-                self.check_pending_orders_timeout()
 
                 # 记录本次循环耗时（只在异常时告警）
                 loop_end = time.time()
